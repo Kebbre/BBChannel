@@ -108,7 +108,7 @@
   <main>
     <header>
       <h1>Create a New Channel</h1>
-      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.9.1.</p>
+      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.10</p>
     </header>
     <form id="channel-form" autocomplete="off">
       <div>
@@ -148,6 +148,15 @@
         .map((value) => (typeof value === 'string' ? value.trim() : ''))
         .filter(Boolean)
         .map((value) => value.toLowerCase());
+      const GRAPH_ITEM_BASE_SEGMENTS = ['Documents', 'Proformat'];
+      const GRAPH_TEMPLATE_PATH_SEGMENTS = GRAPH_ITEM_BASE_SEGMENTS
+        .map((segment) => (typeof segment === 'string' ? segment.trim() : ''))
+        .filter(Boolean);
+      const GRAPH_TEMPLATE_COPY_ENABLED = GRAPH_TEMPLATE_PATH_SEGMENTS.length > 0;
+      const GRAPH_CHANNEL_FILES_FOLDER_MAX_ATTEMPTS = 8;
+      const GRAPH_CHANNEL_FILES_FOLDER_DELAY_MS = 1500;
+      const GRAPH_COPY_STATUS_POLL_INTERVAL_MS = 2000;
+      const GRAPH_COPY_STATUS_TIMEOUT_MS = 4 * 60 * 1000;
 
       const form = document.getElementById('channel-form');
       const input = document.getElementById('channel-name');
@@ -200,6 +209,249 @@
           console.debug('Unable to resolve tab configuration.', error);
           return null;
         }
+      }
+
+      function encodeDrivePathSegments(segments) {
+        return segments
+          .map((segment) => encodeURIComponent(segment))
+          .join('/');
+      }
+
+      async function fetchTemplateFolder(accessToken) {
+        if (!GRAPH_TEMPLATE_COPY_ENABLED || !GRAPH_TEMPLATE_PATH_SEGMENTS.length) {
+          return null;
+        }
+        const displayPath = GRAPH_TEMPLATE_PATH_SEGMENTS.join('/');
+        const encodedPath = encodeDrivePathSegments(GRAPH_TEMPLATE_PATH_SEGMENTS);
+        const response = await graphRequest(`/me/drive/root:/${encodedPath}`, accessToken);
+        if (response.status === 404) {
+          throw new Error(`Template folder not found at "/${displayPath}".`);
+        }
+        if (!response.ok) {
+          throw new Error(await readGraphErrorMessage(response, 'Unable to access the template folder.'));
+        }
+        const payload = await response.json();
+        if (!payload?.folder) {
+          throw new Error(`Template path "/${displayPath}" is not a folder.`);
+        }
+        if (!payload?.id) {
+          throw new Error('Template folder metadata is missing an identifier.');
+        }
+        return payload;
+      }
+
+      async function ensureChannelFilesFolder(channelId, accessToken) {
+        if (!teamId) {
+          throw new Error('Team context unavailable for locating channel files folder.');
+        }
+        for (let attempt = 0; attempt < GRAPH_CHANNEL_FILES_FOLDER_MAX_ATTEMPTS; attempt += 1) {
+          const response = await graphRequest(`/teams/${teamId}/channels/${channelId}/filesFolder`, accessToken);
+          if (response.status === 200) {
+            const payload = await response.json();
+            const driveId = payload?.driveId || payload?.parentReference?.driveId;
+            if (payload?.id && driveId) {
+              return {
+                id: payload.id,
+                driveId,
+                name: payload.name || '',
+                raw: payload
+              };
+            }
+          } else if (response.status === 202 || response.status === 404) {
+            // Folder not provisioned yet; wait and retry.
+          } else {
+            throw new Error(await readGraphErrorMessage(response, 'Unable to locate the channel files folder.'));
+          }
+          if (attempt < GRAPH_CHANNEL_FILES_FOLDER_MAX_ATTEMPTS - 1) {
+            await delay(GRAPH_CHANNEL_FILES_FOLDER_DELAY_MS * Math.max(1, attempt + 1));
+          }
+        }
+        throw new Error('Channel files folder not yet available.');
+      }
+
+      function normaliseGraphNextLink(nextLink) {
+        if (typeof nextLink !== 'string') {
+          return null;
+        }
+        let candidate = nextLink.trim();
+        if (!candidate) {
+          return null;
+        }
+        try {
+          const absolute = new URL(candidate);
+          candidate = `${absolute.pathname}${absolute.search}`;
+        } catch (error) {
+          // Relative path already.
+        }
+        if (candidate.startsWith(`${GRAPH_RESOURCE}/v1.0`)) {
+          candidate = candidate.slice(`${GRAPH_RESOURCE}/v1.0`.length);
+        }
+        if (candidate.startsWith('/v1.0')) {
+          candidate = candidate.slice('/v1.0'.length);
+        }
+        if (!candidate.startsWith('/')) {
+          candidate = `/${candidate}`;
+        }
+        return candidate;
+      }
+
+      async function listTemplateFolderChildren(folderId, accessToken) {
+        const items = [];
+        let path = `/me/drive/items/${folderId}/children`;
+        while (path) {
+          const response = await graphRequest(path, accessToken);
+          if (!response.ok) {
+            throw new Error(await readGraphErrorMessage(response, 'Unable to read template folder contents.'));
+          }
+          const payload = await response.json();
+          if (Array.isArray(payload?.value)) {
+            items.push(...payload.value.filter((item) => item?.id && item?.name));
+          }
+          const nextLink = normaliseGraphNextLink(payload?.['@odata.nextLink']);
+          path = nextLink;
+        }
+        return items;
+      }
+
+      async function monitorGraphCopyOperation(operationUrl, accessToken, { initialDelayMs = GRAPH_COPY_STATUS_POLL_INTERVAL_MS } = {}) {
+        if (!operationUrl) {
+          return;
+        }
+        const startTime = Date.now();
+        let waitMs = Math.max(0, initialDelayMs);
+        while ((Date.now() - startTime) < GRAPH_COPY_STATUS_TIMEOUT_MS) {
+          if (waitMs > 0) {
+            await delay(waitMs);
+          }
+          const response = await fetch(operationUrl, {
+            method: 'GET',
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Accept': 'application/json'
+            }
+          });
+          if (response.status >= 400) {
+            throw new Error(await readGraphErrorMessage(response, 'Copy operation monitoring failed.'));
+          }
+          if (response.status === 204) {
+            return;
+          }
+          let payload = null;
+          try {
+            payload = await response.json();
+          } catch (error) {
+            payload = null;
+          }
+          const status = typeof payload?.status === 'string' ? payload.status.toLowerCase() : '';
+          if (!status) {
+            if (response.status === 200 || response.status === 201) {
+              return;
+            }
+          } else if (status === 'completed') {
+            return;
+          } else if (status === 'failed') {
+            throw new Error(payload?.error?.message || 'Template copy operation failed.');
+          }
+          const retryAfterHeader = response.headers.get('Retry-After');
+          const retrySeconds = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) : NaN;
+          waitMs = Number.isFinite(retrySeconds) && retrySeconds > 0
+            ? retrySeconds * 1000
+            : GRAPH_COPY_STATUS_POLL_INTERVAL_MS;
+        }
+        throw new Error('Timed out waiting for template content to copy.');
+      }
+
+      async function copyDriveItemToDestination(item, destination, accessToken) {
+        const driveId = destination?.driveId;
+        const folderId = destination?.id;
+        if (!item?.id || !driveId || !folderId) {
+          throw new Error('Missing information required to copy the template content.');
+        }
+        const response = await graphRequest(`/me/drive/items/${item.id}/copy`, accessToken, {
+          method: 'POST',
+          headers: {
+            'Prefer': 'respond-async'
+          },
+          body: {
+            name: item.name,
+            parentReference: {
+              driveId,
+              id: folderId
+            }
+          }
+        });
+        if (response.status === 409) {
+          return { conflict: true };
+        }
+        if (response.status === 201 || response.status === 200 || response.status === 204) {
+          return { success: true };
+        }
+        if (response.status === 202) {
+          const locationUrl = response.headers.get('Location') || response.headers.get('location');
+          const retryAfterHeader = response.headers.get('Retry-After');
+          const retrySeconds = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) : NaN;
+          const initialDelayMs = Number.isFinite(retrySeconds) && retrySeconds > 0
+            ? retrySeconds * 1000
+            : GRAPH_COPY_STATUS_POLL_INTERVAL_MS;
+          await monitorGraphCopyOperation(locationUrl, accessToken, { initialDelayMs });
+          return { success: true };
+        }
+        throw new Error(await readGraphErrorMessage(response, `Unable to copy "${item.name}".`));
+      }
+
+      async function duplicateTemplateFolderToChannel(channel, accessToken) {
+        if (!GRAPH_TEMPLATE_COPY_ENABLED) {
+          return { skipped: true };
+        }
+        if (!channel?.id) {
+          return { error: 'Channel identifier unavailable for template content copy.' };
+        }
+        let templateFolder = null;
+        try {
+          templateFolder = await fetchTemplateFolder(accessToken);
+        } catch (error) {
+          return { error: error?.message || 'Unable to resolve the template folder.' };
+        }
+        if (!templateFolder) {
+          return { skipped: true };
+        }
+        let destinationFolder = null;
+        try {
+          destinationFolder = await ensureChannelFilesFolder(channel.id, accessToken);
+        } catch (error) {
+          return { error: error?.message || 'Unable to access the channel files folder.' };
+        }
+        let children = [];
+        try {
+          children = await listTemplateFolderChildren(templateFolder.id, accessToken);
+        } catch (error) {
+          return { error: error?.message || 'Unable to read template folder contents.' };
+        }
+        if (!Array.isArray(children) || !children.length) {
+          return { copied: 0, empty: true };
+        }
+        let copied = 0;
+        let conflicts = 0;
+        for (const item of children) {
+          if (!item?.id || !item?.name) {
+            continue;
+          }
+          try {
+            const outcome = await copyDriveItemToDestination(item, destinationFolder, accessToken);
+            if (outcome?.conflict) {
+              conflicts += 1;
+            } else {
+              copied += 1;
+            }
+          } catch (copyError) {
+            return {
+              error: copyError?.message || `Unable to copy "${item?.name}".`,
+              copied,
+              conflicts
+            };
+          }
+        }
+        return { copied, conflicts };
       }
 
       async function readGraphErrorMessage(response, fallbackMessage) {
@@ -657,6 +909,13 @@
 
         if (response.status === 201) {
           const payload = await response.json();
+          let filesOutcome = { skipped: !GRAPH_TEMPLATE_COPY_ENABLED };
+          try {
+            filesOutcome = await duplicateTemplateFolderToChannel(payload, accessToken);
+          } catch (filesError) {
+            filesOutcome = { error: filesError?.message || 'Unable to apply template content to the Files tab.' };
+            console.error('Copying template content failed.', filesError);
+          }
           let tabOutcome = { skipped: !TAB_APP_REFERENCE_IDS.length };
           try {
             tabOutcome = await ensureChannelTab(payload, accessToken);
@@ -664,7 +923,7 @@
             tabOutcome = { error: tabError?.message || 'Unable to add the app tab to the channel.' };
             console.error('Adding default app tab failed.', tabError);
           }
-          return { channel: payload, tabOutcome };
+          return { channel: payload, tabOutcome, filesOutcome };
         }
 
         const errorMessage = await readGraphErrorMessage(response, 'Unable to create the channel.');
@@ -680,8 +939,21 @@
           const result = await createChannel(requestedName);
           const channelName = result?.channel?.displayName || requestedName.trim();
           const tabOutcome = result?.tabOutcome || {};
+          const filesOutcome = result?.filesOutcome || {};
 
           let message = `Channel "${channelName}" created successfully.`;
+          if (filesOutcome.copied > 0) {
+            message += ` ${filesOutcome.copied} item(s) copied to Files tab.`;
+          }
+          if (filesOutcome.conflicts) {
+            message += ` ${filesOutcome.conflicts} item(s) already existed in Files.`;
+          }
+          if (filesOutcome.empty && !filesOutcome.copied && !filesOutcome.conflicts) {
+            message += ' Template folder was empty.';
+          }
+          if (filesOutcome.error) {
+            message += `\nHowever, template content could not be copied: ${filesOutcome.error}`;
+          }
           if (tabOutcome.created) {
             message += ' App tab added.';
           } else if (tabOutcome.alreadyExists) {
@@ -692,7 +964,7 @@
             message += `\nHowever, the app tab could not be added: ${tabOutcome.error}`;
           }
 
-          const tone = tabOutcome.error ? 'error' : 'success';
+          const tone = (tabOutcome.error || filesOutcome.error) ? 'error' : 'success';
           setStatus(message, tone);
           input.value = '';
         } catch (error) {
