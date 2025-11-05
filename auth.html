@@ -39,27 +39,77 @@
       const redirectUri = new URL('auth.html', window.location.href).toString();
       const GRAPH_SCOPES = ['User.Read', 'Files.ReadWrite.All', 'Channel.Create'];
       const REDIRECT_SESSION_KEY = 'bbprogramme:auth-redirect-started';
-      const searchParams = new URLSearchParams(window.location.search || '');
-      const launchedFromTeams = searchParams.get('teams') === '1';
+      const TOKEN_REDIRECT_KEY = 'bbprogramme:auth-token-redirect';
+      const teams = window.microsoftTeams;
 
-      async function notifyCompletion(payload) {
-        const origin = window.location.origin;
-        let teamsInitialised = false;
-        const teams = window.microsoftTeams;
+      function setRedirectFlag(key) {
+        try {
+          window.sessionStorage.setItem(key, '1');
+        } catch (storageError) {
+          console.debug('Unable to set redirect flag.', storageError);
+        }
+      }
+
+      function clearRedirectFlag(key) {
+        try {
+          window.sessionStorage.removeItem(key);
+        } catch (storageError) {
+          console.debug('Unable to clear redirect flag.', storageError);
+        }
+      }
+
+      function hasRedirectFlag(key) {
+        try {
+          return window.sessionStorage.getItem(key) === '1';
+        } catch (storageError) {
+          console.debug('Unable to read redirect flag.', storageError);
+          return false;
+        }
+      }
+
+      async function initialiseTeamsSdk() {
+        if (!teams) {
+          return null;
+        }
         if (teams?.app && typeof teams.app.initialize === 'function') {
           try {
             await teams.app.initialize();
-            teamsInitialised = true;
           } catch (teamsInitError) {
-            console.debug('Teams SDK initialisation failed in auth window.', teamsInitError);
+            console.debug('Teams app.initialize failed in auth window.', teamsInitError);
           }
         }
-        if (teamsInitialised && teams?.authentication) {
+        if (typeof teams?.initialize === 'function') {
+          try {
+            await new Promise((resolve) => {
+              try {
+                teams.initialize(
+                  () => resolve(),
+                  (reason) => {
+                    console.debug('Teams initialize callback returned error in auth window.', reason);
+                    resolve();
+                  }
+                );
+              } catch (legacyInitError) {
+                console.debug('Teams legacy initialize threw in auth window.', legacyInitError);
+                resolve();
+              }
+            });
+          } catch (legacyInitOuterError) {
+            console.debug('Teams legacy initialize outer failure.', legacyInitOuterError);
+          }
+        }
+        return teams;
+      }
+
+      async function notifyCompletion(payload) {
+        const origin = window.location.origin;
+        const initialisedTeams = await initialiseTeamsSdk();
+        if (initialisedTeams?.authentication) {
           try {
             if (payload.success) {
-              teams.authentication.notifySuccess(JSON.stringify(payload));
+              initialisedTeams.authentication.notifySuccess(JSON.stringify(payload));
             } else {
-              teams.authentication.notifyFailure(payload.error || 'Authentication failed.');
+              initialisedTeams.authentication.notifyFailure(payload.error || 'Authentication failed.');
             }
           } catch (teamsNotifyError) {
             console.debug('Unable to notify Teams authentication result.', teamsNotifyError);
@@ -91,17 +141,26 @@
 
       const app = new window.msal.PublicClientApplication({
         auth: { clientId: CLIENT_ID, authority, redirectUri },
-        cache: { cacheLocation: 'localStorage', storeAuthStateInCookie: false }
+        cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: true }
       });
+
       try {
         if (typeof app.initialize === 'function') {
           await app.initialize();
         }
-        const result = await app.handleRedirectPromise();
-        if (result?.account) {
-          app.setActiveAccount(result.account);
+
+        let redirectResult = null;
+        try {
+          redirectResult = await app.handleRedirectPromise();
+        } catch (handleRedirectError) {
+          console.error('Authentication redirect handling failed.', handleRedirectError);
         }
-        let account = result?.account || null;
+
+        if (redirectResult?.account) {
+          app.setActiveAccount(redirectResult.account);
+        }
+
+        let account = redirectResult?.account || null;
         if (!account) {
           const accounts = app.getAllAccounts();
           if (accounts.length) {
@@ -109,47 +168,99 @@
             app.setActiveAccount(account);
           }
         }
+
         if (!account) {
-          if (!window.sessionStorage.getItem(REDIRECT_SESSION_KEY)) {
-            window.sessionStorage.setItem(REDIRECT_SESSION_KEY, '1');
+          if (!hasRedirectFlag(REDIRECT_SESSION_KEY)) {
+            setRedirectFlag(REDIRECT_SESSION_KEY);
             try {
               await app.loginRedirect({
                 scopes: GRAPH_SCOPES,
                 prompt: 'select_account',
-                redirectStartPage: redirectUri
+                redirectStartPage: window.location.href
               });
               return;
             } catch (loginError) {
               console.error('Authentication redirect invocation failed.', loginError);
-              window.sessionStorage.removeItem(REDIRECT_SESSION_KEY);
+              clearRedirectFlag(REDIRECT_SESSION_KEY);
               await notifyCompletion({
                 success: false,
                 error: loginError?.message || String(loginError || 'Unable to start authentication.')
               });
               return;
             }
-          } else {
-            window.sessionStorage.removeItem(REDIRECT_SESSION_KEY);
-            await notifyCompletion({
-              success: false,
-              error: 'Authentication completed without selecting an account.'
-            });
-            return;
           }
-        } else {
-          window.sessionStorage.removeItem(REDIRECT_SESSION_KEY);
+          clearRedirectFlag(REDIRECT_SESSION_KEY);
+          await notifyCompletion({
+            success: false,
+            error: 'Authentication completed without selecting an account.'
+          });
+          return;
         }
+
+        clearRedirectFlag(REDIRECT_SESSION_KEY);
+
+        let tokenResult = redirectResult;
+        if (!tokenResult?.accessToken) {
+          try {
+            tokenResult = await app.acquireTokenSilent({
+              account,
+              scopes: GRAPH_SCOPES
+            });
+          } catch (silentError) {
+            const needsInteraction = (window.msal && window.msal.InteractionRequiredAuthError
+              && silentError instanceof window.msal.InteractionRequiredAuthError)
+              || silentError?.name === 'InteractionRequiredAuthError'
+              || silentError?.errorCode === 'interaction_required'
+              || silentError?.errorCode === 'consent_required'
+              || silentError?.errorCode === 'no_tokens_found';
+            if (needsInteraction) {
+              if (!hasRedirectFlag(TOKEN_REDIRECT_KEY)) {
+                setRedirectFlag(TOKEN_REDIRECT_KEY);
+                await app.acquireTokenRedirect({
+                  account,
+                  scopes: GRAPH_SCOPES,
+                  redirectStartPage: window.location.href
+                });
+                return;
+              }
+              clearRedirectFlag(TOKEN_REDIRECT_KEY);
+              await notifyCompletion({
+                success: false,
+                error: 'Authentication cancelled before acquiring an access token.'
+              });
+              return;
+            }
+            clearRedirectFlag(TOKEN_REDIRECT_KEY);
+            throw silentError;
+          }
+        }
+
+        clearRedirectFlag(TOKEN_REDIRECT_KEY);
+
+        if (!tokenResult?.accessToken) {
+          await notifyCompletion({
+            success: false,
+            error: 'Authentication did not return an access token.'
+          });
+          return;
+        }
+
         const payload = {
           success: true,
-          account: {
-            homeAccountId: account.homeAccountId,
-            username: account.username,
-            name: account.name || null
-          }
+          accessToken: tokenResult.accessToken,
+          expiresOn: tokenResult.expiresOn instanceof Date ? tokenResult.expiresOn.toISOString() : null,
+          account: account
+            ? {
+                homeAccountId: account.homeAccountId,
+                username: account.username,
+                name: account.name || null
+              }
+            : null
         };
+
         await notifyCompletion(payload);
       } catch (error) {
-        console.error('Authentication redirect handling failed.', error);
+        console.error('Authentication flow failed.', error);
         await notifyCompletion({
           success: false,
           error: error?.message || String(error || 'Unknown error')

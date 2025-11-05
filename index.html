@@ -102,14 +102,13 @@
       color: #065f46;
     }
   </style>
-  <script src="https://alcdn.msauth.net/browser/2.37.0/js/msal-browser.min.js" crossorigin="anonymous"></script>
   <script src="https://res.cdn.office.net/teams-js/2.17.0/js/MicrosoftTeams.min.js" crossorigin="anonymous"></script>
 </head>
 <body>
   <main>
     <header>
       <h1>Create a New Channel</h1>
-      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.5.</p>
+      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.6.</p>
     </header>
     <form id="channel-form" autocomplete="off">
       <div>
@@ -131,12 +130,6 @@
     (function channelCreator() {
       let teams = window.microsoftTeams || null;
       const GRAPH_RESOURCE = 'https://graph.microsoft.com';
-      const GRAPH_SCOPES = ['User.Read', 'Channel.Create'];
-      const CLIENT_ID = '11110eb6-00e3-4870-a044-670147117b83';
-      const TENANT_ID = '6dc7041f-549e-4127-9e89-36f74513bad5';
-      const authority = TENANT_ID
-        ? `https://login.microsoftonline.com/${TENANT_ID}`
-        : 'https://login.microsoftonline.com/common';
       const authRedirectUri = new URL('auth.html?teams=1', window.location.href).toString();
 
       const form = document.getElementById('channel-form');
@@ -144,10 +137,11 @@
       const button = document.getElementById('generate-button');
       const statusEl = document.getElementById('status');
 
-      let msalApp;
-      let account;
       let teamId;
-      let acquiringToken = null;
+      let cachedAccessToken = null;
+      let cachedAccessTokenExpiry = 0;
+      const TOKEN_EXPIRY_BUFFER_MS = 2 * 60 * 1000;
+      const DEFAULT_TOKEN_TTL_MS = 55 * 60 * 1000;
 
       function delay(ms) {
         return new Promise((resolve) => setTimeout(resolve, ms));
@@ -262,27 +256,41 @@
         }
       }
 
-      function initMsal() {
-        if (msalApp) {
+      function applyAuthenticationPayload(payload) {
+        if (!payload || !payload.accessToken) {
+          return null;
+        }
+        cachedAccessToken = payload.accessToken;
+        let expiresAt = 0;
+        if (payload.expiresOn) {
+          const parsed = Date.parse(payload.expiresOn);
+          if (!Number.isNaN(parsed)) {
+            expiresAt = parsed;
+          }
+        } else if (typeof payload.expiresIn === 'number' && Number.isFinite(payload.expiresIn)) {
+          expiresAt = Date.now() + Math.max(0, payload.expiresIn * 1000);
+        }
+        if (!expiresAt) {
+          expiresAt = Date.now() + DEFAULT_TOKEN_TTL_MS;
+        }
+        cachedAccessTokenExpiry = expiresAt;
+        return cachedAccessToken;
+      }
+
+      window.addEventListener('message', (event) => {
+        if (event.origin !== window.location.origin) {
           return;
         }
-        msalApp = new window.msal.PublicClientApplication({
-          auth: {
-            clientId: CLIENT_ID,
-            authority,
-            redirectUri: new URL('auth.html', window.location.href).toString()
-          },
-          cache: {
-            cacheLocation: 'localStorage',
-            storeAuthStateInCookie: false
-          }
-        });
-        const cached = msalApp.getActiveAccount() || msalApp.getAllAccounts()[0];
-        if (cached) {
-          msalApp.setActiveAccount(cached);
-          account = cached;
+        const data = event.data;
+        if (!data || typeof data !== 'object' || data.type !== 'bbprogramme-auth-complete') {
+          return;
         }
-      }
+        if (!data.success) {
+          console.debug('Authentication message indicated failure.', data.error);
+          return;
+        }
+        applyAuthenticationPayload(data);
+      });
 
       async function interactiveLogin() {
         const result = await runTeamsAuthentication({
@@ -293,58 +301,41 @@
         if (!result) {
           throw new Error('Authentication did not return a result.');
         }
-        try {
-          const payload = JSON.parse(result);
-          if (!payload?.success) {
-            throw new Error(payload?.error || 'Authentication failed.');
+        let payload = null;
+        if (typeof result === 'string') {
+          try {
+            payload = JSON.parse(result);
+          } catch (parseError) {
+            payload = { accessToken: result };
           }
-        } catch (parseError) {
-          console.warn('Unable to parse authentication result payload.', parseError);
+        } else if (typeof result === 'object') {
+          payload = result;
         }
-        const accounts = msalApp.getAllAccounts();
-        if (!accounts.length) {
-          throw new Error('No authenticated account found after login.');
+        if (payload?.success === false) {
+          throw new Error(payload?.error || 'Authentication failed.');
         }
-        msalApp.setActiveAccount(accounts[0]);
-        account = accounts[0];
+        if (!payload?.accessToken && typeof result === 'string') {
+          payload = { accessToken: result };
+        }
+        if (!payload?.accessToken) {
+          throw new Error('Authentication response did not include an access token.');
+        }
+        applyAuthenticationPayload(payload);
+        return cachedAccessToken;
       }
 
-      async function acquireGraphToken() {
-        if (acquiringToken) {
-          return acquiringToken;
+      async function acquireGraphToken({ forceRefresh = false } = {}) {
+        const now = Date.now();
+        if (!forceRefresh && cachedAccessToken && (cachedAccessTokenExpiry - TOKEN_EXPIRY_BUFFER_MS) > now) {
+          return cachedAccessToken;
         }
-        acquiringToken = (async () => {
-          initMsal();
-          if (!account) {
-            await interactiveLogin();
-          }
-          try {
-            const silentResult = await msalApp.acquireTokenSilent({
-              account,
-              scopes: GRAPH_SCOPES
-            });
-            return silentResult?.accessToken;
-          } catch (error) {
-            const needsInteraction = (window.msal && window.msal.InteractionRequiredAuthError
-              && error instanceof window.msal.InteractionRequiredAuthError)
-              || error?.name === 'InteractionRequiredAuthError'
-              || error?.errorCode === 'interaction_required'
-              || error?.errorCode === 'consent_required'
-              || error?.errorCode === 'no_tokens_found';
-            if (!needsInteraction) {
-              throw error;
-            }
-            await interactiveLogin();
-            const retryResult = await msalApp.acquireTokenSilent({
-              account,
-              scopes: GRAPH_SCOPES
-            });
-            return retryResult?.accessToken;
-          } finally {
-            acquiringToken = null;
-          }
-        })();
-        return acquiringToken;
+        cachedAccessToken = null;
+        cachedAccessTokenExpiry = 0;
+        const token = await interactiveLogin();
+        if (!token) {
+          throw new Error('Unable to acquire an access token for Microsoft Graph.');
+        }
+        return token;
       }
 
       async function createChannel(displayName) {
@@ -356,21 +347,35 @@
           throw new Error('Channel names must be 50 characters or fewer.');
         }
 
-        const accessToken = await acquireGraphToken();
+        async function sendCreateRequest(token) {
+          return fetch(`${GRAPH_RESOURCE}/v1.0/teams/${teamId}/channels`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              displayName: trimmedName
+            })
+          });
+        }
+
+        let accessToken = await acquireGraphToken();
         if (!accessToken) {
           throw new Error('Unable to acquire an access token for Microsoft Graph.');
         }
 
-        const response = await fetch(`${GRAPH_RESOURCE}/v1.0/teams/${teamId}/channels`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${accessToken}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            displayName: trimmedName
-          })
-        });
+        let response = await sendCreateRequest(accessToken);
+
+        if (response.status === 401) {
+          cachedAccessToken = null;
+          cachedAccessTokenExpiry = 0;
+          accessToken = await acquireGraphToken({ forceRefresh: true });
+          if (!accessToken) {
+            throw new Error('Authentication expired. Please sign in again.');
+          }
+          response = await sendCreateRequest(accessToken);
+        }
 
         if (response.status === 201) {
           const payload = await response.json();
@@ -411,7 +416,6 @@
         try {
           setStatus('Connecting to Microsoft Teams...');
           await bootstrapTeamsContext();
-          initMsal();
           setStatus('Ready to create channels.');
           setFormEnabled(true);
         } catch (error) {
