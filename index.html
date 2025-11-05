@@ -108,7 +108,7 @@
   <main>
     <header>
       <h1>Create a New Channel</h1>
-      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.10</p>
+      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.11</p>
     </header>
     <form id="channel-form" autocomplete="off">
       <div>
@@ -295,6 +295,43 @@
         return candidate;
       }
 
+      function normaliseCopyMonitorUrl(operationUrl) {
+        if (typeof operationUrl !== 'string' || !operationUrl.trim()) {
+          return null;
+        }
+        let candidate = operationUrl.trim();
+        try {
+          const parsed = new URL(candidate, GRAPH_RESOURCE);
+          const lowerHost = parsed.host.toLowerCase();
+          if (lowerHost.includes('sharepoint.com')) {
+            // SharePoint async endpoints use /_api/v2.0; convert to graph-relative path.
+            const pathSegments = parsed.pathname.split('/').filter(Boolean);
+            const apiIndex = pathSegments.findIndex((segment) => segment.toLowerCase() === '_api');
+            if (apiIndex >= 0) {
+              const versionSegment = pathSegments[apiIndex + 1]?.toLowerCase() === 'v2.0' ? apiIndex + 2 : apiIndex + 1;
+              const remaining = pathSegments.slice(versionSegment);
+              candidate = `/${remaining.join('/')}${parsed.search}`;
+            } else {
+              candidate = `${parsed.pathname}${parsed.search}`;
+            }
+          } else if (parsed.origin.toLowerCase() === GRAPH_RESOURCE.toLowerCase()) {
+            candidate = `${parsed.pathname}${parsed.search}`;
+          }
+        } catch (error) {
+          // Treat as relative path.
+        }
+        if (candidate.startsWith(`${GRAPH_RESOURCE}/v1.0`)) {
+          candidate = candidate.slice(`${GRAPH_RESOURCE}/v1.0`.length);
+        }
+        if (candidate.startsWith('/v1.0')) {
+          candidate = candidate.slice('/v1.0'.length);
+        }
+        if (!candidate.startsWith('/')) {
+          candidate = `/${candidate}`;
+        }
+        return `${GRAPH_RESOURCE}/v1.0${candidate}`;
+      }
+
       async function listTemplateFolderChildren(folderId, accessToken) {
         const items = [];
         let path = `/me/drive/items/${folderId}/children`;
@@ -317,13 +354,14 @@
         if (!operationUrl) {
           return;
         }
+        const resolvedUrl = normaliseCopyMonitorUrl(operationUrl) || operationUrl;
         const startTime = Date.now();
         let waitMs = Math.max(0, initialDelayMs);
         while ((Date.now() - startTime) < GRAPH_COPY_STATUS_TIMEOUT_MS) {
           if (waitMs > 0) {
             await delay(waitMs);
           }
-          const response = await fetch(operationUrl, {
+          const response = await fetch(resolvedUrl, {
             method: 'GET',
             headers: {
               'Authorization': `Bearer ${accessToken}`,
@@ -387,13 +425,16 @@
           return { success: true };
         }
         if (response.status === 202) {
-          const locationUrl = response.headers.get('Location') || response.headers.get('location');
+          const asyncOperationUrl = response.headers.get('Azure-AsyncOperation')
+            || response.headers.get('azure-asyncoperation')
+            || response.headers.get('Location')
+            || response.headers.get('location');
           const retryAfterHeader = response.headers.get('Retry-After');
           const retrySeconds = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) : NaN;
           const initialDelayMs = Number.isFinite(retrySeconds) && retrySeconds > 0
             ? retrySeconds * 1000
             : GRAPH_COPY_STATUS_POLL_INTERVAL_MS;
-          await monitorGraphCopyOperation(locationUrl, accessToken, { initialDelayMs });
+          await monitorGraphCopyOperation(asyncOperationUrl, accessToken, { initialDelayMs });
           return { success: true };
         }
         throw new Error(await readGraphErrorMessage(response, `Unable to copy "${item.name}".`));
