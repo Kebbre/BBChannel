@@ -108,7 +108,7 @@
   <main>
     <header>
       <h1>Create a New Channel</h1>
-      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.12</p>
+      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.13</p>
     </header>
     <form id="channel-form" autocomplete="off">
       <div>
@@ -299,35 +299,29 @@
         if (typeof operationUrl !== 'string' || !operationUrl.trim()) {
           return null;
         }
-        let candidate = operationUrl.trim();
+        const trimmed = operationUrl.trim();
         try {
-          const parsed = new URL(candidate, GRAPH_RESOURCE);
+          const parsed = new URL(trimmed, GRAPH_RESOURCE);
+          const lowerOrigin = parsed.origin.toLowerCase();
           const lowerHost = parsed.host.toLowerCase();
           if (lowerHost.includes('sharepoint.com')) {
-            // SharePoint async endpoints use /_api/v2.x; convert to graph-relative path.
-            const pathSegments = parsed.pathname.split('/').filter(Boolean);
-            const apiIndex = pathSegments.findIndex((segment) => segment.toLowerCase() === '_api');
-            if (apiIndex >= 0) {
-              let startIndex = apiIndex + 1;
-              const versionPattern = /^v\d+(\.\d+)?$/i;
-              while (startIndex < pathSegments.length && versionPattern.test(pathSegments[startIndex])) {
-                startIndex += 1;
-              }
-              const remaining = pathSegments.slice(startIndex);
-              if (remaining.length) {
-                candidate = `/${remaining.join('/')}${parsed.search}`;
-              } else {
-                candidate = `${parsed.pathname}${parsed.search}`;
-              }
-            } else {
-              candidate = `${parsed.pathname}${parsed.search}`;
+            return `${parsed.origin}${parsed.pathname}${parsed.search}`;
+          }
+          if (lowerOrigin === GRAPH_RESOURCE.toLowerCase()) {
+            let path = parsed.pathname || '';
+            let query = parsed.search || '';
+            if (path.startsWith('/v1.0')) {
+              path = path.slice('/v1.0'.length);
             }
-          } else if (parsed.origin.toLowerCase() === GRAPH_RESOURCE.toLowerCase()) {
-            candidate = `${parsed.pathname}${parsed.search}`;
+            if (!path.startsWith('/')) {
+              path = `/${path}`;
+            }
+            return `${GRAPH_RESOURCE}/v1.0${path}${query}`;
           }
         } catch (error) {
           // Treat as relative path.
         }
+        let candidate = trimmed;
         if (candidate.startsWith(`${GRAPH_RESOURCE}/v1.0`)) {
           candidate = candidate.slice(`${GRAPH_RESOURCE}/v1.0`.length);
         }
