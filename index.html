@@ -108,7 +108,7 @@
   <main>
     <header>
       <h1>Create a New Channel</h1>
-      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.7.</p>
+      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.8.</p>
     </header>
     <form id="channel-form" autocomplete="off">
       <div>
@@ -131,10 +131,17 @@
       let teams = window.microsoftTeams || null;
       const GRAPH_RESOURCE = 'https://graph.microsoft.com';
       const authRedirectUri = new URL('auth.html?teams=1', window.location.href).toString();
-      const TAB_APP_ID = 'f291bad4-213e-4d16-a8da-e123274b3d2f';
-      const TAB_DISPLAY_NAME = 'Bond Bryan App';
-      const TAB_CONFIGURATION_TEMPLATE = null;
-      const TAB_APP_ID_NORMALISED = typeof TAB_APP_ID === 'string' ? TAB_APP_ID.toLowerCase() : null;
+      const TAB_APP_REFERENCE_IDS = [
+        '34297257-95fb-4214-96e3-729ef51c516c',
+        'f291bad4-213e-4d16-a8da-e123274b3d2f'
+      ].filter(Boolean);
+      const TAB_DISPLAY_NAME = 'Programme';
+      const TAB_CONFIG_BASE_URL = 'https://kebbre.github.io/BBProgramme/';
+      const TAB_CONFIGURATION_TEMPLATE = ({ channel, teamId: currentTeamId }) => ({
+        entityId: channel?.id || '',
+        contentUrl: `${TAB_CONFIG_BASE_URL}?team=${encodeURIComponent(currentTeamId || '')}&channel=${encodeURIComponent(channel?.id || '')}`,
+        websiteUrl: TAB_CONFIG_BASE_URL
+      });
       const APP_INSTALLATION_MAX_ATTEMPTS = 5;
       const APP_INSTALLATION_DELAY_MS = 1200;
 
@@ -146,6 +153,9 @@
       let teamId;
       let cachedAccessToken = null;
       let cachedAccessTokenExpiry = 0;
+      let resolvedCatalogAppId = null;
+      let resolvedCatalogAppIdNormalised = null;
+      let resolvingCatalogAppId = null;
       const TOKEN_EXPIRY_BUFFER_MS = 2 * 60 * 1000;
       const DEFAULT_TOKEN_TTL_MS = 55 * 60 * 1000;
 
@@ -234,8 +244,71 @@
         return fetch(`${GRAPH_RESOURCE}/v1.0${path}`, init);
       }
 
-      async function listInstalledApps(team, accessToken) {
-        const filter = encodeURIComponent(`teamsApp/id eq '${TAB_APP_ID}'`);
+      async function resolveCatalogAppId(accessToken) {
+        if (!TAB_APP_REFERENCE_IDS.length) {
+          return null;
+        }
+        if (resolvedCatalogAppId) {
+          return resolvedCatalogAppId;
+        }
+        if (resolvingCatalogAppId) {
+          return resolvingCatalogAppId;
+        }
+        resolvingCatalogAppId = (async () => {
+          for (const candidateReference of TAB_APP_REFERENCE_IDS) {
+            const trimmedCandidate = candidateReference?.trim();
+            if (!trimmedCandidate) {
+              continue;
+            }
+            try {
+              const filter = encodeURIComponent(`externalId eq '${trimmedCandidate}'`);
+              const response = await graphRequest(`/appCatalogs/teamsApps?$filter=${filter}&$select=id,externalId,displayName`, accessToken);
+              if (response.ok) {
+                const payload = await response.json();
+                if (Array.isArray(payload?.value) && payload.value.length) {
+                  return payload.value[0]?.id || null;
+                }
+              } else if (response.status !== 404) {
+                const message = await readGraphErrorMessage(response, `Unable to look up app by external ID ${trimmedCandidate}.`);
+                console.debug('App catalog lookup by externalId failed.', response.status, message);
+              }
+            } catch (lookupError) {
+              console.debug('App catalog lookup by externalId threw.', lookupError);
+            }
+
+            try {
+              const directResponse = await graphRequest(`/appCatalogs/teamsApps/${trimmedCandidate}?$select=id,externalId,displayName`, accessToken);
+              if (directResponse.ok) {
+                const directPayload = await directResponse.json();
+                if (directPayload?.id) {
+                  return directPayload.id;
+                }
+              } else if (directResponse.status !== 404) {
+                const message = await readGraphErrorMessage(directResponse, `Unable to look up app by catalog ID ${trimmedCandidate}.`);
+                console.debug('App catalog direct lookup failed.', directResponse.status, message);
+              }
+            } catch (directError) {
+              console.debug('App catalog direct lookup threw.', directError);
+            }
+          }
+          throw new Error('App not found in the tenant app catalog.');
+        })();
+
+        try {
+          const catalogId = await resolvingCatalogAppId;
+          resolvedCatalogAppId = catalogId;
+          resolvedCatalogAppIdNormalised = normaliseId(catalogId);
+          return catalogId;
+        } finally {
+          resolvingCatalogAppId = null;
+        }
+      }
+
+      async function listInstalledApps(team, accessToken, catalogAppId) {
+        if (!catalogAppId) {
+          return [];
+        }
+        const filter = encodeURIComponent(`teamsApp/id eq '${catalogAppId}'`);
         const response = await graphRequest(`/teams/${team}/installedApps?$filter=${filter}&$select=id`, accessToken);
         if (!response.ok) {
           throw new Error(await readGraphErrorMessage(response, 'Unable to verify existing app installations.'));
@@ -244,12 +317,12 @@
         return Array.isArray(payload?.value) ? payload.value : [];
       }
 
-      async function ensureTeamsAppInstalled(team, accessToken) {
-        if (!TAB_APP_ID) {
-          return null;
+      async function ensureTeamsAppInstalled(team, accessToken, catalogAppId) {
+        if (!catalogAppId) {
+          throw new Error('Unable to determine the Teams app catalog identifier.');
         }
         try {
-          const existing = await listInstalledApps(team, accessToken);
+          const existing = await listInstalledApps(team, accessToken, catalogAppId);
           if (existing.length) {
             return existing[0]?.id || null;
           }
@@ -260,7 +333,7 @@
         const installResponse = await graphRequest(`/teams/${team}/installedApps`, accessToken, {
           method: 'POST',
           body: {
-            'teamsApp@odata.bind': `${GRAPH_RESOURCE}/v1.0/appCatalogs/teamsApps/${TAB_APP_ID}`
+            'teamsApp@odata.bind': `${GRAPH_RESOURCE}/v1.0/appCatalogs/teamsApps/${catalogAppId}`
           }
         });
         if (installResponse.status === 201) {
@@ -274,7 +347,7 @@
         for (let attempt = 0; attempt < APP_INSTALLATION_MAX_ATTEMPTS; attempt += 1) {
           await delay(APP_INSTALLATION_DELAY_MS * (attempt + 1));
           try {
-            const existing = await listInstalledApps(team, accessToken);
+            const existing = await listInstalledApps(team, accessToken, catalogAppId);
             if (existing.length) {
               return existing[0]?.id || null;
             }
@@ -285,8 +358,8 @@
         return null;
       }
 
-      async function findExistingTab(channelId, accessToken) {
-        if (!TAB_APP_ID || !teamId) {
+      async function findExistingTab(channelId, accessToken, catalogAppIdNormalised) {
+        if (!catalogAppIdNormalised || !teamId) {
           return null;
         }
         const response = await graphRequest(`/teams/${teamId}/channels/${channelId}/tabs?$expand=teamsApp`, accessToken);
@@ -299,12 +372,12 @@
           const tabAppId = normaliseId(tab?.teamsApp?.id)
             || normaliseId(tab?.teamsAppId)
             || normaliseId(tab?.teamsApp?.externalId);
-          return tabAppId && tabAppId === TAB_APP_ID_NORMALISED;
+          return tabAppId && tabAppId === catalogAppIdNormalised;
         }) || null;
       }
 
       async function ensureChannelTab(channel, accessToken) {
-        if (!TAB_APP_ID) {
+        if (!TAB_APP_REFERENCE_IDS.length) {
           return { skipped: true };
         }
         if (!teamId) {
@@ -314,8 +387,22 @@
           return { error: 'Channel identifier unavailable for app tab creation.' };
         }
 
+        let catalogAppId;
         try {
-          const existingTab = await findExistingTab(channel.id, accessToken);
+          catalogAppId = await resolveCatalogAppId(accessToken);
+        } catch (catalogError) {
+          return { error: catalogError?.message || 'Unable to resolve the Teams app definition.' };
+        }
+        if (!catalogAppId) {
+          return { error: 'Unable to resolve the Teams app definition.' };
+        }
+        const catalogAppIdNormalised = resolvedCatalogAppIdNormalised || normaliseId(catalogAppId);
+        if (!catalogAppIdNormalised) {
+          return { error: 'Unable to normalise the Teams app identifier.' };
+        }
+
+        try {
+          const existingTab = await findExistingTab(channel.id, accessToken, catalogAppIdNormalised);
           if (existingTab) {
             return { alreadyExists: true };
           }
@@ -324,14 +411,14 @@
         }
 
         try {
-          await ensureTeamsAppInstalled(teamId, accessToken);
+          await ensureTeamsAppInstalled(teamId, accessToken, catalogAppId);
         } catch (installError) {
           throw new Error(installError?.message || 'Unable to install the Teams app before creating the tab.');
         }
 
         const tabPayload = {
           displayName: resolveTabDisplayName(channel),
-          'teamsApp@odata.bind': `${GRAPH_RESOURCE}/v1.0/appCatalogs/teamsApps/${TAB_APP_ID}`
+          'teamsApp@odata.bind': `${GRAPH_RESOURCE}/v1.0/appCatalogs/teamsApps/${catalogAppId}`
         };
         const configuration = resolveTabConfiguration({ channel, teamId });
         if (configuration) {
@@ -585,7 +672,7 @@
 
         if (response.status === 201) {
           const payload = await response.json();
-          let tabOutcome = { skipped: !TAB_APP_ID };
+          let tabOutcome = { skipped: !TAB_APP_REFERENCE_IDS.length };
           try {
             tabOutcome = await ensureChannelTab(payload, accessToken);
           } catch (tabError) {
