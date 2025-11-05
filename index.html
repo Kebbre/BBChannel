@@ -108,7 +108,7 @@
   <main>
     <header>
       <h1>Create a New Channel</h1>
-      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.13</p>
+      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.14</p>
     </header>
     <form id="channel-form" autocomplete="off">
       <div>
@@ -157,6 +157,7 @@
       const GRAPH_CHANNEL_FILES_FOLDER_DELAY_MS = 1500;
       const GRAPH_COPY_STATUS_POLL_INTERVAL_MS = 2000;
       const GRAPH_COPY_STATUS_TIMEOUT_MS = 4 * 60 * 1000;
+      const GRAPH_TEMPLATE_NAME_PLACEHOLDER = 'ABC';
 
       const form = document.getElementById('channel-form');
       const input = document.getElementById('channel-name');
@@ -209,6 +210,56 @@
           console.debug('Unable to resolve tab configuration.', error);
           return null;
         }
+      }
+
+      function escapeRegExp(value) {
+        return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      }
+
+      function sanitiseDriveItemToken(value) {
+        if (typeof value !== 'string') {
+          return '';
+        }
+        let candidate = value.trim();
+        if (!candidate) {
+          return '';
+        }
+        candidate = candidate
+          .replace(/[<>:"/\\|?*]/g, '-')
+          .replace(/\s+/g, ' ');
+        candidate = candidate.replace(/[. ]+$/g, '').replace(/^[. ]+/g, '');
+        if (!candidate) {
+          return '';
+        }
+        if (candidate === '.' || candidate === '..') {
+          candidate = candidate.replace(/\./g, '-');
+        }
+        return candidate;
+      }
+
+      function resolveTemplateCopyName(originalName, channelName) {
+        if (typeof originalName !== 'string' || !originalName) {
+          return { name: originalName, changed: false };
+        }
+        if (!GRAPH_TEMPLATE_NAME_PLACEHOLDER) {
+          return { name: originalName, changed: false };
+        }
+        const placeholderPattern = new RegExp(escapeRegExp(GRAPH_TEMPLATE_NAME_PLACEHOLDER), 'gi');
+        if (!placeholderPattern.test(originalName)) {
+          return { name: originalName, changed: false };
+        }
+        const sanitisedChannel = sanitiseDriveItemToken(channelName || '');
+        if (!sanitisedChannel) {
+          return { name: originalName, changed: false };
+        }
+        const replaced = originalName.replace(
+          new RegExp(escapeRegExp(GRAPH_TEMPLATE_NAME_PLACEHOLDER), 'gi'),
+          sanitisedChannel
+        );
+        return {
+          name: replaced,
+          changed: replaced !== originalName
+        };
       }
 
       function encodeDrivePathSegments(segments) {
@@ -356,21 +407,52 @@
         if (!operationUrl) {
           return;
         }
-        const resolvedUrl = normaliseCopyMonitorUrl(operationUrl) || operationUrl;
+        let resolvedUrl = normaliseCopyMonitorUrl(operationUrl) || operationUrl;
+        let parsedUrl = null;
+        try {
+          parsedUrl = new URL(resolvedUrl, GRAPH_RESOURCE);
+        } catch (error) {
+          try {
+            parsedUrl = new URL(`${GRAPH_RESOURCE}/v1.0${resolvedUrl}`, GRAPH_RESOURCE);
+          } catch (innerError) {
+            parsedUrl = null;
+          }
+        }
+        if (!parsedUrl) {
+          await delay(Math.max(initialDelayMs, GRAPH_COPY_STATUS_POLL_INTERVAL_MS));
+          return;
+        }
+        const monitorUrl = parsedUrl.toString();
+        const monitorHost = (parsedUrl.host || '').toLowerCase();
+        const isSharePointMonitor = monitorHost.includes('sharepoint.com') || monitorHost.includes('sharepoint-df.com');
+        if (isSharePointMonitor) {
+          await delay(Math.max(initialDelayMs, GRAPH_COPY_STATUS_POLL_INTERVAL_MS + 2000));
+          return;
+        }
         const startTime = Date.now();
         let waitMs = Math.max(0, initialDelayMs);
         while ((Date.now() - startTime) < GRAPH_COPY_STATUS_TIMEOUT_MS) {
           if (waitMs > 0) {
             await delay(waitMs);
           }
-          const response = await fetch(resolvedUrl, {
-            method: 'GET',
-            headers: {
-              'Authorization': `Bearer ${accessToken}`,
-              'Accept': 'application/json'
-            }
-          });
+          let response;
+          try {
+            response = await fetch(monitorUrl, {
+              method: 'GET',
+              headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Accept': 'application/json'
+              }
+            });
+          } catch (requestError) {
+            console.debug('Copy operation monitoring request failed.', requestError);
+            await delay(GRAPH_COPY_STATUS_POLL_INTERVAL_MS);
+            continue;
+          }
           if (response.status >= 400) {
+            if (response.status === 404 || response.status === 401 || response.status === 403) {
+              return;
+            }
             throw new Error(await readGraphErrorMessage(response, 'Copy operation monitoring failed.'));
           }
           if (response.status === 204) {
@@ -398,22 +480,27 @@
             ? retrySeconds * 1000
             : GRAPH_COPY_STATUS_POLL_INTERVAL_MS;
         }
-        throw new Error('Timed out waiting for template content to copy.');
+        console.debug('Timed out waiting for template copy operation to report completion.');
       }
 
-      async function copyDriveItemToDestination(item, destination, accessToken) {
+      async function copyDriveItemToDestination(item, destination, accessToken, options = {}) {
         const driveId = destination?.driveId;
         const folderId = destination?.id;
         if (!item?.id || !driveId || !folderId) {
           throw new Error('Missing information required to copy the template content.');
         }
+        const channelDisplayName = typeof options?.channelDisplayName === 'string' ? options.channelDisplayName : '';
+        const nameResolution = resolveTemplateCopyName(item?.name || '', channelDisplayName);
+        const targetName = nameResolution?.name || item?.name || '';
+        const renameApplied = Boolean(item?.name) && targetName && item?.name !== targetName;
         const response = await graphRequest(`/me/drive/items/${item.id}/copy`, accessToken, {
           method: 'POST',
           headers: {
             'Prefer': 'respond-async'
           },
           body: {
-            name: item.name,
+            name: targetName,
+            '@microsoft.graph.conflictBehavior': 'rename',
             parentReference: {
               driveId,
               id: folderId
@@ -421,10 +508,10 @@
           }
         });
         if (response.status === 409) {
-          return { conflict: true };
+          return { conflict: true, renamed: false };
         }
         if (response.status === 201 || response.status === 200 || response.status === 204) {
-          return { success: true };
+          return { success: true, renamed: renameApplied };
         }
         if (response.status === 202) {
           const asyncOperationUrl = response.headers.get('Azure-AsyncOperation')
@@ -437,64 +524,72 @@
             ? retrySeconds * 1000
             : GRAPH_COPY_STATUS_POLL_INTERVAL_MS;
           await monitorGraphCopyOperation(asyncOperationUrl, accessToken, { initialDelayMs });
-          return { success: true };
+          return { success: true, renamed: renameApplied };
         }
         throw new Error(await readGraphErrorMessage(response, `Unable to copy "${item.name}".`));
       }
 
       async function duplicateTemplateFolderToChannel(channel, accessToken) {
         if (!GRAPH_TEMPLATE_COPY_ENABLED) {
-          return { skipped: true };
+          return { skipped: true, renamed: 0 };
         }
         if (!channel?.id) {
-          return { error: 'Channel identifier unavailable for template content copy.' };
+          return { error: 'Channel identifier unavailable for template content copy.', renamed: 0 };
         }
+        const channelDisplayName = typeof channel?.displayName === 'string'
+          ? channel.displayName
+          : (typeof channel?.name === 'string' ? channel.name : '');
         let templateFolder = null;
         try {
           templateFolder = await fetchTemplateFolder(accessToken);
         } catch (error) {
-          return { error: error?.message || 'Unable to resolve the template folder.' };
+          return { error: error?.message || 'Unable to resolve the template folder.', renamed: 0 };
         }
         if (!templateFolder) {
-          return { skipped: true };
+          return { skipped: true, renamed: 0 };
         }
         let destinationFolder = null;
         try {
           destinationFolder = await ensureChannelFilesFolder(channel.id, accessToken);
         } catch (error) {
-          return { error: error?.message || 'Unable to access the channel files folder.' };
+          return { error: error?.message || 'Unable to access the channel files folder.', renamed: 0 };
         }
         let children = [];
         try {
           children = await listTemplateFolderChildren(templateFolder.id, accessToken);
         } catch (error) {
-          return { error: error?.message || 'Unable to read template folder contents.' };
+          return { error: error?.message || 'Unable to read template folder contents.', renamed: 0 };
         }
         if (!Array.isArray(children) || !children.length) {
-          return { copied: 0, empty: true };
+          return { copied: 0, empty: true, renamed: 0 };
         }
         let copied = 0;
         let conflicts = 0;
+        let renamed = 0;
         for (const item of children) {
           if (!item?.id || !item?.name) {
             continue;
           }
           try {
-            const outcome = await copyDriveItemToDestination(item, destinationFolder, accessToken);
+            const outcome = await copyDriveItemToDestination(item, destinationFolder, accessToken, { channelDisplayName });
             if (outcome?.conflict) {
               conflicts += 1;
             } else {
               copied += 1;
+              if (outcome?.renamed) {
+                renamed += 1;
+              }
             }
           } catch (copyError) {
             return {
               error: copyError?.message || `Unable to copy "${item?.name}".`,
               copied,
-              conflicts
+              conflicts,
+              renamed
             };
           }
         }
-        return { copied, conflicts };
+        return { copied, conflicts, renamed };
       }
 
       async function readGraphErrorMessage(response, fallbackMessage) {
@@ -952,7 +1047,7 @@
 
         if (response.status === 201) {
           const payload = await response.json();
-          let filesOutcome = { skipped: !GRAPH_TEMPLATE_COPY_ENABLED };
+          let filesOutcome = { skipped: !GRAPH_TEMPLATE_COPY_ENABLED, renamed: 0 };
           try {
             filesOutcome = await duplicateTemplateFolderToChannel(payload, accessToken);
           } catch (filesError) {
@@ -981,12 +1076,15 @@
           const requestedName = input.value;
           const result = await createChannel(requestedName);
           const channelName = result?.channel?.displayName || requestedName.trim();
-          const tabOutcome = result?.tabOutcome || {};
-          const filesOutcome = result?.filesOutcome || {};
+          const tabOutcome = { ...(result?.tabOutcome || {}) };
+          const filesOutcome = { renamed: 0, ...(result?.filesOutcome || {}) };
 
           let message = `Channel "${channelName}" created successfully.`;
           if (filesOutcome.copied > 0) {
             message += ` ${filesOutcome.copied} item(s) copied to Files tab.`;
+          }
+          if (filesOutcome.renamed) {
+            message += ` ${filesOutcome.renamed} item(s) renamed to match the channel.`;
           }
           if (filesOutcome.conflicts) {
             message += ` ${filesOutcome.conflicts} item(s) already existed in Files.`;
