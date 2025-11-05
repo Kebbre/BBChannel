@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Teams Channel Creator</title>
+  <link rel="icon" href="color.png">
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+      background: linear-gradient(140deg, #f5f7fb 0%, #e4e7f1 45%, #dbe0ef 100%);
+      color: #1f2937;
+    }
+    main {
+      width: min(420px, 90vw);
+      padding: 2.25rem;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.85);
+      box-shadow: 0 30px 50px rgba(15, 39, 89, 0.15);
+      backdrop-filter: blur(14px);
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+    header h1 {
+      margin: 0;
+      font-size: clamp(1.4rem, 4vw, 1.8rem);
+      font-weight: 600;
+      color: #111827;
+    }
+    header p {
+      margin: 0.35rem 0 0;
+      color: #4b5563;
+      font-size: 0.95rem;
+      line-height: 1.45;
+    }
+    form {
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+    }
+    label {
+      font-weight: 600;
+      font-size: 0.9rem;
+      color: #374151;
+    }
+    input[type="text"] {
+      width: 100%;
+      border: 1px solid #cbd5f5;
+      border-radius: 10px;
+      padding: 0.8rem 0.95rem;
+      font-size: 1rem;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+      background: #f9faff;
+    }
+    input[type="text"]:focus {
+      outline: none;
+      border-color: #5865f2;
+      box-shadow: 0 0 0 3px rgba(88, 101, 242, 0.2);
+      background: #ffffff;
+    }
+    button {
+      border: none;
+      border-radius: 999px;
+      padding: 0.85rem 1.5rem;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      background: linear-gradient(135deg, #4b6ef5, #6d83ff);
+      color: #ffffff;
+      box-shadow: 0 12px 22px rgba(75, 110, 245, 0.25);
+      transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+    }
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 16px 28px rgba(75, 110, 245, 0.35);
+    }
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+    #status {
+      font-size: 0.92rem;
+      line-height: 1.4;
+      color: #374151;
+      min-height: 2rem;
+      white-space: pre-line;
+    }
+    #status.error {
+      color: #dc2626;
+    }
+    #status.success {
+      color: #065f46;
+    }
+  </style>
+  <script src="https://alcdn.msauth.net/browser/2.37.0/js/msal-browser.min.js" crossorigin="anonymous"></script>
+  <script src="https://res.cdn.office.net/teams-js/v2.17.0/js/MicrosoftTeams.min.js" crossorigin="anonymous"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Create a New Channel</h1>
+      <p>Enter a name and generate a fresh channel in this team without leaving the tab.</p>
+    </header>
+    <form id="channel-form" autocomplete="off">
+      <div>
+        <label for="channel-name">Channel name</label>
+        <input
+          type="text"
+          id="channel-name"
+          name="channel-name"
+          maxlength="50"
+          placeholder="e.g. Launch Planning"
+          required
+        >
+      </div>
+      <button type="submit" id="generate-button" disabled>Generate</button>
+    </form>
+    <div id="status" role="status" aria-live="polite" aria-atomic="true"></div>
+  </main>
+  <script>
+    (function channelCreator() {
+      const teams = window.microsoftTeams;
+      const GRAPH_RESOURCE = 'https://graph.microsoft.com';
+      const GRAPH_SCOPES = ['User.Read', 'Channel.Create', 'Group.ReadWrite.All'];
+      const CLIENT_ID = '64eaf9c0-93d7-4bda-9f02-b343bc459350';
+      const TENANT_ID = '6dc7041f-549e-4127-9e89-36f74513bad5';
+      const authority = TENANT_ID
+        ? `https://login.microsoftonline.com/${TENANT_ID}`
+        : 'https://login.microsoftonline.com/common';
+      const authRedirectUri = new URL('auth.html?teams=1', window.location.href).toString();
+
+      const form = document.getElementById('channel-form');
+      const input = document.getElementById('channel-name');
+      const button = document.getElementById('generate-button');
+      const statusEl = document.getElementById('status');
+
+      let msalApp;
+      let account;
+      let teamId;
+      let acquiringToken = null;
+
+      function setStatus(message, tone) {
+        statusEl.textContent = message || '';
+        statusEl.classList.remove('error', 'success');
+        if (tone) {
+          statusEl.classList.add(tone);
+        }
+      }
+
+      function setFormEnabled(enabled) {
+        input.disabled = !enabled;
+        button.disabled = !enabled;
+      }
+
+      async function bootstrapTeamsContext() {
+        if (!teams?.app || typeof teams.app.initialize !== 'function') {
+          throw new Error('Microsoft Teams SDK unavailable. Please run this tab inside Microsoft Teams.');
+        }
+        await teams.app.initialize();
+        const context = await teams.app.getContext();
+        teamId = context?.team?.groupId || null;
+        if (!teamId) {
+          throw new Error('This experience is only available inside a team channel tab.');
+        }
+      }
+
+      function initMsal() {
+        if (msalApp) {
+          return;
+        }
+        msalApp = new window.msal.PublicClientApplication({
+          auth: {
+            clientId: CLIENT_ID,
+            authority,
+            redirectUri: new URL('auth.html', window.location.href).toString()
+          },
+          cache: {
+            cacheLocation: 'localStorage',
+            storeAuthStateInCookie: false
+          }
+        });
+        const cached = msalApp.getActiveAccount() || msalApp.getAllAccounts()[0];
+        if (cached) {
+          msalApp.setActiveAccount(cached);
+          account = cached;
+        }
+      }
+
+      async function interactiveLogin() {
+        if (!teams?.authentication?.authenticate) {
+          throw new Error('Teams authentication APIs unavailable.');
+        }
+        const result = await teams.authentication.authenticate({
+          url: authRedirectUri,
+          width: 640,
+          height: 640
+        });
+        if (!result) {
+          throw new Error('Authentication did not return a result.');
+        }
+        try {
+          const payload = JSON.parse(result);
+          if (!payload?.success) {
+            throw new Error(payload?.error || 'Authentication failed.');
+          }
+        } catch (parseError) {
+          console.warn('Unable to parse authentication result payload.', parseError);
+        }
+        const accounts = msalApp.getAllAccounts();
+        if (!accounts.length) {
+          throw new Error('No authenticated account found after login.');
+        }
+        msalApp.setActiveAccount(accounts[0]);
+        account = accounts[0];
+      }
+
+      async function acquireGraphToken() {
+        if (acquiringToken) {
+          return acquiringToken;
+        }
+        acquiringToken = (async () => {
+          initMsal();
+          if (!account) {
+            await interactiveLogin();
+          }
+          try {
+            const silentResult = await msalApp.acquireTokenSilent({
+              account,
+              scopes: GRAPH_SCOPES
+            });
+            return silentResult?.accessToken;
+          } catch (error) {
+            const needsInteraction = (window.msal && window.msal.InteractionRequiredAuthError
+              && error instanceof window.msal.InteractionRequiredAuthError)
+              || error?.name === 'InteractionRequiredAuthError'
+              || error?.errorCode === 'interaction_required'
+              || error?.errorCode === 'consent_required'
+              || error?.errorCode === 'no_tokens_found';
+            if (!needsInteraction) {
+              throw error;
+            }
+            await interactiveLogin();
+            const retryResult = await msalApp.acquireTokenSilent({
+              account,
+              scopes: GRAPH_SCOPES
+            });
+            return retryResult?.accessToken;
+          } finally {
+            acquiringToken = null;
+          }
+        })();
+        return acquiringToken;
+      }
+
+      async function createChannel(displayName) {
+        const trimmedName = displayName.trim();
+        if (!trimmedName) {
+          throw new Error('Please provide a channel name.');
+        }
+        if (trimmedName.length > 50) {
+          throw new Error('Channel names must be 50 characters or fewer.');
+        }
+
+        const accessToken = await acquireGraphToken();
+        if (!accessToken) {
+          throw new Error('Unable to acquire an access token for Microsoft Graph.');
+        }
+
+        const response = await fetch(`${GRAPH_RESOURCE}/v1.0/teams/${teamId}/channels`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            displayName: trimmedName
+          })
+        });
+
+        if (response.status === 201) {
+          const payload = await response.json();
+          return payload;
+        }
+
+        let errorMessage = 'Unable to create the channel.';
+        try {
+          const errorPayload = await response.json();
+          const graphError = errorPayload?.error?.message || errorPayload?.message;
+          if (graphError) {
+            errorMessage = graphError;
+          }
+        } catch (parseError) {
+          console.debug('Unable to parse Graph error payload.', parseError);
+        }
+        throw new Error(errorMessage);
+      }
+
+      async function handleSubmit(event) {
+        event.preventDefault();
+        setFormEnabled(false);
+        setStatus('Creating channel...');
+        try {
+          const channel = await createChannel(input.value);
+          setStatus(`Channel "${channel?.displayName || input.value.trim()}" created successfully.`, 'success');
+          input.value = '';
+        } catch (error) {
+          const message = error?.message || 'Unable to create channel.';
+          setStatus(message, 'error');
+          console.error('Channel creation failed.', error);
+        } finally {
+          setFormEnabled(true);
+        }
+      }
+
+      async function initialise() {
+        try {
+          await bootstrapTeamsContext();
+          initMsal();
+          setStatus('Ready to create channels.');
+          setFormEnabled(true);
+        } catch (error) {
+          setStatus(error?.message || 'Unable to initialise the experience.', 'error');
+          console.error('Initialisation failed.', error);
+        }
+      }
+
+      form.addEventListener('submit', handleSubmit);
+      setFormEnabled(false);
+      initialise();
+    }());
+  </script>
+</body>
+</html>

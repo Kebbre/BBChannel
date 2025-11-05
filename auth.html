@@ -27,7 +27,7 @@
 </head>
 <body>
   <div class="message">
-    <p>Completing Microsoft sign-in…</p>
+    <p>Completing Microsoft sign-in...</p>
   </div>
   <script>
     (async function finishAuthentication() {
@@ -37,7 +37,7 @@
         ? `https://login.microsoftonline.com/${TENANT_ID}`
         : 'https://login.microsoftonline.com/common';
       const redirectUri = new URL('auth.html', window.location.href).toString();
-      const GRAPH_SCOPES = ['User.Read', 'Files.ReadWrite.All'];
+      const GRAPH_SCOPES = ['User.Read', 'Files.ReadWrite.All', 'Channel.Create', 'Group.ReadWrite.All'];
       const REDIRECT_SESSION_KEY = 'bbprogramme:auth-redirect-started';
       const searchParams = new URLSearchParams(window.location.search || '');
       const launchedFromTeams = searchParams.get('teams') === '1';
