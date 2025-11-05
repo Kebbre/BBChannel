@@ -109,7 +109,7 @@
   <main>
     <header>
       <h1>Create a New Channel</h1>
-      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.3.</p>
+      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.4.</p>
     </header>
     <form id="channel-form" autocomplete="off">
       <div>
@@ -131,7 +131,7 @@
     (function channelCreator() {
       let teams = window.microsoftTeams || null;
       const GRAPH_RESOURCE = 'https://graph.microsoft.com';
-      const GRAPH_SCOPES = ['User.Read', 'Channel.Create', 'Group.ReadWrite.All'];
+      const GRAPH_SCOPES = ['User.Read', 'Channel.Create'];
       const CLIENT_ID = '11110eb6-00e3-4870-a044-670147117b83';
       const TENANT_ID = '6dc7041f-549e-4127-9e89-36f74513bad5';
       const authority = TENANT_ID

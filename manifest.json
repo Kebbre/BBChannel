@@ -8,7 +8,7 @@
   },
   "developer": {
     "name": "Kebbre",
-    "websiteUrl": "https://kebbre.github.io/BBChannel/",
+    "websiteUrl": "https://kebbre.github.io/BBChannel/index.html",
     "privacyUrl": "https://kebbre.github.io/BBChannel/privacy.html",
     "termsOfUseUrl": "https://kebbre.github.io/BBChannel/terms.html"
   },
@@ -25,7 +25,7 @@
     {
       "entityId": "f7bb3ac3-bd3e-40ba-9d5b-4369c244a94a",
       "name": "BBChannels",
-      "contentUrl": "https://kebbre.github.io/BBChannel/",
+      "contentUrl": "https://kebbre.github.io/BBChannel/index.html",
       "scopes": [
         "personal",
         "groupChat",
@@ -41,7 +41,8 @@
     "kebbre.github.io",
     "login.microsoftonline.com",
     "alcdn.msauth.net",
-    "res.cdn.office.net"
+    "res.cdn.office.net",
+    "statics.teams.cdn.office.net"
   ],
   "webApplicationInfo": {
     "id": "11110eb6-00e3-4870-a044-670147117b83",
