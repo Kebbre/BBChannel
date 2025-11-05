@@ -108,7 +108,7 @@
   <main>
     <header>
       <h1>Create a New Channel</h1>
-      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.11</p>
+      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.12</p>
     </header>
     <form id="channel-form" autocomplete="off">
       <div>
@@ -304,13 +304,21 @@
           const parsed = new URL(candidate, GRAPH_RESOURCE);
           const lowerHost = parsed.host.toLowerCase();
           if (lowerHost.includes('sharepoint.com')) {
-            // SharePoint async endpoints use /_api/v2.0; convert to graph-relative path.
+            // SharePoint async endpoints use /_api/v2.x; convert to graph-relative path.
             const pathSegments = parsed.pathname.split('/').filter(Boolean);
             const apiIndex = pathSegments.findIndex((segment) => segment.toLowerCase() === '_api');
             if (apiIndex >= 0) {
-              const versionSegment = pathSegments[apiIndex + 1]?.toLowerCase() === 'v2.0' ? apiIndex + 2 : apiIndex + 1;
-              const remaining = pathSegments.slice(versionSegment);
-              candidate = `/${remaining.join('/')}${parsed.search}`;
+              let startIndex = apiIndex + 1;
+              const versionPattern = /^v\d+(\.\d+)?$/i;
+              while (startIndex < pathSegments.length && versionPattern.test(pathSegments[startIndex])) {
+                startIndex += 1;
+              }
+              const remaining = pathSegments.slice(startIndex);
+              if (remaining.length) {
+                candidate = `/${remaining.join('/')}${parsed.search}`;
+              } else {
+                candidate = `${parsed.pathname}${parsed.search}`;
+              }
             } else {
               candidate = `${parsed.pathname}${parsed.search}`;
             }
