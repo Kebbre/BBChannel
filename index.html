@@ -108,7 +108,7 @@
   <main>
     <header>
       <h1>Create a New Channel</h1>
-      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.6.</p>
+      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.7.</p>
     </header>
     <form id="channel-form" autocomplete="off">
       <div>
@@ -131,6 +131,12 @@
       let teams = window.microsoftTeams || null;
       const GRAPH_RESOURCE = 'https://graph.microsoft.com';
       const authRedirectUri = new URL('auth.html?teams=1', window.location.href).toString();
+      const TAB_APP_ID = 'f291bad4-213e-4d16-a8da-e123274b3d2f';
+      const TAB_DISPLAY_NAME = 'Bond Bryan App';
+      const TAB_CONFIGURATION_TEMPLATE = null;
+      const TAB_APP_ID_NORMALISED = typeof TAB_APP_ID === 'string' ? TAB_APP_ID.toLowerCase() : null;
+      const APP_INSTALLATION_MAX_ATTEMPTS = 5;
+      const APP_INSTALLATION_DELAY_MS = 1200;
 
       const form = document.getElementById('channel-form');
       const input = document.getElementById('channel-name');
@@ -145,6 +151,206 @@
 
       function delay(ms) {
         return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      function normaliseId(value) {
+        return typeof value === 'string' ? value.toLowerCase() : '';
+      }
+
+      function resolveTabDisplayName(channel) {
+        try {
+          if (typeof TAB_DISPLAY_NAME === 'function') {
+            const resolved = TAB_DISPLAY_NAME({ channel, teamId });
+            if (resolved) {
+              return String(resolved);
+            }
+          } else if (TAB_DISPLAY_NAME) {
+            return String(TAB_DISPLAY_NAME);
+          }
+        } catch (error) {
+          console.debug('Unable to resolve tab display name.', error);
+        }
+        return channel?.displayName || 'Channel App';
+      }
+
+      function resolveTabConfiguration(context) {
+        if (!TAB_CONFIGURATION_TEMPLATE) {
+          return null;
+        }
+        try {
+          const template = typeof TAB_CONFIGURATION_TEMPLATE === 'function'
+            ? TAB_CONFIGURATION_TEMPLATE(context)
+            : TAB_CONFIGURATION_TEMPLATE;
+          if (!template || typeof template !== 'object') {
+            return null;
+          }
+          return JSON.parse(JSON.stringify(template));
+        } catch (error) {
+          console.debug('Unable to resolve tab configuration.', error);
+          return null;
+        }
+      }
+
+      async function readGraphErrorMessage(response, fallbackMessage) {
+        if (!response) {
+          return fallbackMessage || 'Unknown error';
+        }
+        try {
+          const payload = await response.json();
+          const graphError = payload?.error?.message || payload?.message;
+          if (graphError) {
+            return graphError;
+          }
+        } catch (parseError) {
+          console.debug('Unable to parse Graph error payload.', parseError);
+        }
+        if (response.status && response.statusText) {
+          return `${response.status} ${response.statusText}`.trim();
+        }
+        return fallbackMessage || 'Unknown error';
+      }
+
+      async function graphRequest(path, accessToken, options = {}) {
+        const {
+          method = 'GET',
+          headers,
+          body,
+          ...rest
+        } = options;
+        const requestHeaders = {
+          'Authorization': `Bearer ${accessToken}`,
+          'Accept': 'application/json',
+          ...(headers || {})
+        };
+        const init = {
+          method,
+          ...rest,
+          headers: requestHeaders
+        };
+        if (body !== undefined) {
+          requestHeaders['Content-Type'] = 'application/json';
+          init.body = typeof body === 'string' ? body : JSON.stringify(body);
+        }
+        return fetch(`${GRAPH_RESOURCE}/v1.0${path}`, init);
+      }
+
+      async function listInstalledApps(team, accessToken) {
+        const filter = encodeURIComponent(`teamsApp/id eq '${TAB_APP_ID}'`);
+        const response = await graphRequest(`/teams/${team}/installedApps?$filter=${filter}&$select=id`, accessToken);
+        if (!response.ok) {
+          throw new Error(await readGraphErrorMessage(response, 'Unable to verify existing app installations.'));
+        }
+        const payload = await response.json();
+        return Array.isArray(payload?.value) ? payload.value : [];
+      }
+
+      async function ensureTeamsAppInstalled(team, accessToken) {
+        if (!TAB_APP_ID) {
+          return null;
+        }
+        try {
+          const existing = await listInstalledApps(team, accessToken);
+          if (existing.length) {
+            return existing[0]?.id || null;
+          }
+        } catch (checkError) {
+          console.debug('Unable to check existing app installations.', checkError);
+        }
+
+        const installResponse = await graphRequest(`/teams/${team}/installedApps`, accessToken, {
+          method: 'POST',
+          body: {
+            'teamsApp@odata.bind': `${GRAPH_RESOURCE}/v1.0/appCatalogs/teamsApps/${TAB_APP_ID}`
+          }
+        });
+        if (installResponse.status === 201) {
+          // proceed to verification below
+        } else if (installResponse.status === 409) {
+          console.debug('Teams app already installed in this team.');
+        } else {
+          throw new Error(await readGraphErrorMessage(installResponse, 'Unable to install the Teams app in this team.'));
+        }
+
+        for (let attempt = 0; attempt < APP_INSTALLATION_MAX_ATTEMPTS; attempt += 1) {
+          await delay(APP_INSTALLATION_DELAY_MS * (attempt + 1));
+          try {
+            const existing = await listInstalledApps(team, accessToken);
+            if (existing.length) {
+              return existing[0]?.id || null;
+            }
+          } catch (pollError) {
+            console.debug('App installation verification attempt failed.', pollError);
+          }
+        }
+        return null;
+      }
+
+      async function findExistingTab(channelId, accessToken) {
+        if (!TAB_APP_ID || !teamId) {
+          return null;
+        }
+        const response = await graphRequest(`/teams/${teamId}/channels/${channelId}/tabs?$expand=teamsApp`, accessToken);
+        if (!response.ok) {
+          throw new Error(await readGraphErrorMessage(response, 'Unable to check existing channel tabs.'));
+        }
+        const payload = await response.json();
+        const tabs = Array.isArray(payload?.value) ? payload.value : [];
+        return tabs.find((tab) => {
+          const tabAppId = normaliseId(tab?.teamsApp?.id)
+            || normaliseId(tab?.teamsAppId)
+            || normaliseId(tab?.teamsApp?.externalId);
+          return tabAppId && tabAppId === TAB_APP_ID_NORMALISED;
+        }) || null;
+      }
+
+      async function ensureChannelTab(channel, accessToken) {
+        if (!TAB_APP_ID) {
+          return { skipped: true };
+        }
+        if (!teamId) {
+          return { error: 'Team context unavailable for app tab creation.' };
+        }
+        if (!channel?.id) {
+          return { error: 'Channel identifier unavailable for app tab creation.' };
+        }
+
+        try {
+          const existingTab = await findExistingTab(channel.id, accessToken);
+          if (existingTab) {
+            return { alreadyExists: true };
+          }
+        } catch (lookupError) {
+          console.debug('Unable to check for existing channel tabs.', lookupError);
+        }
+
+        try {
+          await ensureTeamsAppInstalled(teamId, accessToken);
+        } catch (installError) {
+          throw new Error(installError?.message || 'Unable to install the Teams app before creating the tab.');
+        }
+
+        const tabPayload = {
+          displayName: resolveTabDisplayName(channel),
+          'teamsApp@odata.bind': `${GRAPH_RESOURCE}/v1.0/appCatalogs/teamsApps/${TAB_APP_ID}`
+        };
+        const configuration = resolveTabConfiguration({ channel, teamId });
+        if (configuration) {
+          tabPayload.configuration = configuration;
+        }
+
+        const response = await graphRequest(`/teams/${teamId}/channels/${channel.id}/tabs`, accessToken, {
+          method: 'POST',
+          body: tabPayload
+        });
+
+        if (response.status === 201) {
+          return { created: true, tab: await response.json().catch(() => null) };
+        }
+        if (response.status === 409) {
+          return { alreadyExists: true };
+        }
+
+        throw new Error(await readGraphErrorMessage(response, 'Unable to add the app tab to the channel.'));
       }
 
       async function waitForTeamsSdk(timeoutMs = 6000) {
@@ -379,19 +585,17 @@
 
         if (response.status === 201) {
           const payload = await response.json();
-          return payload;
+          let tabOutcome = { skipped: !TAB_APP_ID };
+          try {
+            tabOutcome = await ensureChannelTab(payload, accessToken);
+          } catch (tabError) {
+            tabOutcome = { error: tabError?.message || 'Unable to add the app tab to the channel.' };
+            console.error('Adding default app tab failed.', tabError);
+          }
+          return { channel: payload, tabOutcome };
         }
 
-        let errorMessage = 'Unable to create the channel.';
-        try {
-          const errorPayload = await response.json();
-          const graphError = errorPayload?.error?.message || errorPayload?.message;
-          if (graphError) {
-            errorMessage = graphError;
-          }
-        } catch (parseError) {
-          console.debug('Unable to parse Graph error payload.', parseError);
-        }
+        const errorMessage = await readGraphErrorMessage(response, 'Unable to create the channel.');
         throw new Error(errorMessage);
       }
 
@@ -400,8 +604,24 @@
         setFormEnabled(false);
         setStatus('Creating channel...');
         try {
-          const channel = await createChannel(input.value);
-          setStatus(`Channel "${channel?.displayName || input.value.trim()}" created successfully.`, 'success');
+          const requestedName = input.value;
+          const result = await createChannel(requestedName);
+          const channelName = result?.channel?.displayName || requestedName.trim();
+          const tabOutcome = result?.tabOutcome || {};
+
+          let message = `Channel "${channelName}" created successfully.`;
+          if (tabOutcome.created) {
+            message += ' App tab added.';
+          } else if (tabOutcome.alreadyExists) {
+            message += ' App tab already present.';
+          } else if (tabOutcome.skipped) {
+            // No-op: tab creation intentionally skipped.
+          } else if (tabOutcome.error) {
+            message += `\nHowever, the app tab could not be added: ${tabOutcome.error}`;
+          }
+
+          const tone = tabOutcome.error ? 'error' : 'success';
+          setStatus(message, tone);
           input.value = '';
         } catch (error) {
           const message = error?.message || 'Unable to create channel.';
