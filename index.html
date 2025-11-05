@@ -109,7 +109,7 @@
   <main>
     <header>
       <h1>Create a New Channel</h1>
-      <p>Enter a name and generate a fresh channel in this team without leaving the tab.</p>
+      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.3.</p>
     </header>
     <form id="channel-form" autocomplete="off">
       <div>
@@ -129,7 +129,7 @@
   </main>
   <script>
     (function channelCreator() {
-      const teams = window.microsoftTeams;
+      let teams = window.microsoftTeams || null;
       const GRAPH_RESOURCE = 'https://graph.microsoft.com';
       const GRAPH_SCOPES = ['User.Read', 'Channel.Create', 'Group.ReadWrite.All'];
       const CLIENT_ID = '11110eb6-00e3-4870-a044-670147117b83';
@@ -149,6 +149,68 @@
       let teamId;
       let acquiringToken = null;
 
+      function delay(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      async function waitForTeamsSdk(timeoutMs = 6000) {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+          teams = window.microsoftTeams || teams;
+          if (teams?.app?.initialize || typeof teams?.initialize === 'function') {
+            return teams;
+          }
+          await delay(100);
+        }
+        throw new Error('Microsoft Teams SDK unavailable. Please confirm this tab is running inside Microsoft Teams.');
+      }
+
+      async function runTeamsAuthentication(options) {
+        if (!teams?.authentication?.authenticate) {
+          throw new Error('Teams authentication APIs unavailable.');
+        }
+        return new Promise((resolve, reject) => {
+          let settled = false;
+          const config = {
+            ...options,
+            successCallback: (value) => {
+              if (!settled) {
+                settled = true;
+                resolve(value);
+              }
+            },
+            failureCallback: (reason) => {
+              if (!settled) {
+                settled = true;
+                const error = reason instanceof Error ? reason : new Error(reason || 'Authentication failed.');
+                reject(error);
+              }
+            }
+          };
+          try {
+            const maybePromise = teams.authentication.authenticate(config);
+            if (maybePromise && typeof maybePromise.then === 'function') {
+              maybePromise.then((value) => {
+                if (!settled) {
+                  settled = true;
+                  resolve(value);
+                }
+              }).catch((error) => {
+                if (!settled) {
+                  settled = true;
+                  reject(error);
+                }
+              });
+            }
+          } catch (error) {
+            if (!settled) {
+              settled = true;
+              reject(error);
+            }
+          }
+        });
+      }
+
       function setStatus(message, tone) {
         statusEl.textContent = message || '';
         statusEl.classList.remove('error', 'success');
@@ -163,12 +225,38 @@
       }
 
       async function bootstrapTeamsContext() {
-        if (!teams?.app || typeof teams.app.initialize !== 'function') {
-          throw new Error('Microsoft Teams SDK unavailable. Please run this tab inside Microsoft Teams.');
+        await waitForTeamsSdk();
+        let context;
+
+        if (teams?.app?.initialize && typeof teams.app.getContext === 'function') {
+          await teams.app.initialize();
+          context = await teams.app.getContext();
+        } else if (typeof teams.initialize === 'function' && typeof teams.getContext === 'function') {
+          await new Promise((resolve, reject) => {
+            try {
+              teams.initialize(() => resolve(), (reason) => reject(new Error(reason || 'Teams initialization failed.')));
+            } catch (initError) {
+              reject(initError);
+            }
+          });
+          context = await new Promise((resolve, reject) => {
+            let settled = false;
+            const timeoutId = setTimeout(() => {
+              if (!settled) {
+                reject(new Error('Timed out retrieving Microsoft Teams context.'));
+              }
+            }, 4000);
+            teams.getContext((ctx) => {
+              settled = true;
+              clearTimeout(timeoutId);
+              resolve(ctx);
+            });
+          });
+        } else {
+          throw new Error('Microsoft Teams SDK unavailable. Please make sure the Teams JavaScript SDK is referenced.');
         }
-        await teams.app.initialize();
-        const context = await teams.app.getContext();
-        teamId = context?.team?.groupId || null;
+
+        teamId = context?.team?.groupId || context?.groupId || context?.teamId || null;
         if (!teamId) {
           throw new Error('This experience is only available inside a team channel tab.');
         }
@@ -197,10 +285,7 @@
       }
 
       async function interactiveLogin() {
-        if (!teams?.authentication?.authenticate) {
-          throw new Error('Teams authentication APIs unavailable.');
-        }
-        const result = await teams.authentication.authenticate({
+        const result = await runTeamsAuthentication({
           url: authRedirectUri,
           width: 640,
           height: 640
@@ -324,6 +409,7 @@
 
       async function initialise() {
         try {
+          setStatus('Connecting to Microsoft Teams...');
           await bootstrapTeamsContext();
           initMsal();
           setStatus('Ready to create channels.');
