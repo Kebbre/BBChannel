@@ -108,7 +108,7 @@
   <main>
     <header>
       <h1>Create a New Channel</h1>
-      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.14</p>
+      <p>Enter a name and generate a fresh channel in this team without leaving the tab V1.15</p>
     </header>
     <form id="channel-form" autocomplete="off">
       <div>
@@ -425,10 +425,6 @@
         const monitorUrl = parsedUrl.toString();
         const monitorHost = (parsedUrl.host || '').toLowerCase();
         const isSharePointMonitor = monitorHost.includes('sharepoint.com') || monitorHost.includes('sharepoint-df.com');
-        if (isSharePointMonitor) {
-          await delay(Math.max(initialDelayMs, GRAPH_COPY_STATUS_POLL_INTERVAL_MS + 2000));
-          return;
-        }
         const startTime = Date.now();
         let waitMs = Math.max(0, initialDelayMs);
         while ((Date.now() - startTime) < GRAPH_COPY_STATUS_TIMEOUT_MS) {
@@ -450,7 +446,7 @@
             continue;
           }
           if (response.status >= 400) {
-            if (response.status === 404 || response.status === 401 || response.status === 403) {
+            if (isSharePointMonitor && (response.status === 404 || response.status === 401 || response.status === 403)) {
               return;
             }
             throw new Error(await readGraphErrorMessage(response, 'Copy operation monitoring failed.'));
@@ -529,6 +525,74 @@
         throw new Error(await readGraphErrorMessage(response, `Unable to copy "${item.name}".`));
       }
 
+      async function renameDestinationItems(destinationFolder, channelDisplayName, accessToken) {
+        if (!GRAPH_TEMPLATE_NAME_PLACEHOLDER) {
+          return { renamed: 0, skipped: true };
+        }
+        const sanitisedChannel = sanitiseDriveItemToken(channelDisplayName || '');
+        if (!sanitisedChannel) {
+          return { renamed: 0, skipped: true };
+        }
+        const driveId = destinationFolder?.driveId;
+        const rootId = destinationFolder?.id;
+        if (!driveId || !rootId) {
+          return { renamed: 0, error: 'Destination folder metadata missing for renaming.' };
+        }
+
+        let renamedCount = 0;
+        const stack = [rootId];
+        const visited = new Set();
+
+        while (stack.length) {
+          const currentId = stack.pop();
+          if (!currentId || visited.has(currentId)) {
+            continue;
+          }
+          visited.add(currentId);
+
+          let path = `/drives/${driveId}/items/${currentId}/children`;
+          while (path) {
+            const response = await graphRequest(path, accessToken);
+            if (!response.ok) {
+              return {
+                renamed: renamedCount,
+                error: await readGraphErrorMessage(response, 'Unable to enumerate channel files for renaming.')
+              };
+            }
+            const payload = await response.json();
+            const children = Array.isArray(payload?.value) ? payload.value : [];
+
+            for (const child of children) {
+              if (!child?.id || typeof child?.name !== 'string') {
+                continue;
+              }
+              const renameInfo = resolveTemplateCopyName(child.name, channelDisplayName);
+              if (renameInfo?.changed && renameInfo.name) {
+                const patchResponse = await graphRequest(`/drives/${driveId}/items/${child.id}`, accessToken, {
+                  method: 'PATCH',
+                  body: { name: renameInfo.name }
+                });
+                if (!patchResponse.ok) {
+                  return {
+                    renamed: renamedCount,
+                    error: await readGraphErrorMessage(patchResponse, `Unable to rename "${child.name}".`)
+                  };
+                }
+                renamedCount += 1;
+              }
+              if (child?.folder) {
+                stack.push(child.id);
+              }
+            }
+
+            const nextLink = normaliseGraphNextLink(payload?.['@odata.nextLink']);
+            path = nextLink;
+          }
+        }
+
+        return { renamed: renamedCount };
+      }
+
       async function duplicateTemplateFolderToChannel(channel, accessToken) {
         if (!GRAPH_TEMPLATE_COPY_ENABLED) {
           return { skipped: true, renamed: 0 };
@@ -588,6 +652,18 @@
               renamed
             };
           }
+        }
+        const renameSweep = await renameDestinationItems(destinationFolder, channelDisplayName, accessToken);
+        if (renameSweep?.error) {
+          return {
+            copied,
+            conflicts,
+            renamed: renamed + (renameSweep?.renamed || 0),
+            error: renameSweep.error
+          };
+        }
+        if (renameSweep?.renamed) {
+          renamed += renameSweep.renamed;
         }
         return { copied, conflicts, renamed };
       }
