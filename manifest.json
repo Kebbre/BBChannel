@@ -2,19 +2,19 @@
   "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.23/MicrosoftTeams.schema.json",
   "version": "1.8",
   "manifestVersion": "1.23",
-  "id": "34297257-95fb-4214-96e3-729ef51c516c",
+  "id": "f7bb3ac3-bd3e-40ba-9d5b-4369c244a94a",
   "name": {
-    "short": "Architecture Planner 2"
+    "short": "BBChannels"
   },
   "developer": {
     "name": "Kebbre",
-    "websiteUrl": "https://kebbre.github.io/BBProgramme/",
-    "privacyUrl": "https://kebbre.github.io/BBProgramme/privacy.html",
-    "termsOfUseUrl": "https://kebbre.github.io/BBProgramme/terms.html"
+    "websiteUrl": "https://kebbre.github.io/BBChannel/",
+    "privacyUrl": "https://kebbre.github.io/BBChannel/privacy.html",
+    "termsOfUseUrl": "https://kebbre.github.io/BBChannel/terms.html"
   },
   "description": {
-    "short": "Programme generator 6",
-    "full": "BB programme testing"
+    "short": "Channel Creation V1",
+    "full": "Channel creation app"
   },
   "icons": {
     "outline": "outline.png",
@@ -23,9 +23,9 @@
   "accentColor": "#ffffff",
   "staticTabs": [
     {
-      "entityId": "f579912b-b0f1-4862-acbc-91d87752f8a5",
-      "name": "Planner BB",
-      "contentUrl": "https://kebbre.github.io/BBProgramme/",
+      "entityId": "f7bb3ac3-bd3e-40ba-9d5b-4369c244a94a",
+      "name": "BBChannels",
+      "contentUrl": "https://kebbre.github.io/BBChannel/",
       "scopes": [
         "personal",
         "groupChat",
